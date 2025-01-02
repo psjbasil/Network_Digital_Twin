@@ -1,3 +1,10 @@
+import os
+import sys
+
+# 添加项目根目录到 Python 路径
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(project_root)
+
 from flask import Flask, render_template
 from flask_socketio import SocketIO
 from digital_twin.network_model import NetworkModel
