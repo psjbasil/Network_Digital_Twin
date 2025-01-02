@@ -1,4 +1,4 @@
-from ryu.app.wsgi import ControllerBase, route
+from ryu.app.wsgi import ControllerBase, Response, route
 import json
 
 class TopologyController(ControllerBase):
@@ -14,7 +14,7 @@ class TopologyController(ControllerBase):
         for switch in self.network_monitor.switches:
             switches.append({
                 'dpid': switch.dp.id,
-                'ports': [port.port_no for port in switch.ports]
+                'ports': [{'port_no': port.port_no} for port in switch.ports]
             })
             
         for link in self.network_monitor.links:
@@ -23,7 +23,9 @@ class TopologyController(ControllerBase):
                 'dst': {'dpid': link.dst.dpid, 'port_no': link.dst.port_no}
             })
             
-        return json.dumps({
+        body = json.dumps({
             'switches': switches,
             'links': links
-        }) 
+        })
+        
+        return Response(content_type='application/json', body=body) 
