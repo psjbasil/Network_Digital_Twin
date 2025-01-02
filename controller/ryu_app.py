@@ -1,4 +1,3 @@
-from ryu.app.rest_topology import TopologyController
 from ryu.base import app_manager
 from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
@@ -11,6 +10,7 @@ from ryu.app.wsgi import WSGIApplication
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet
 from ryu.lib.packet import ether_types
+from controller.topology_rest import TopologyController
 
 class NetworkMonitor(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -24,6 +24,8 @@ class NetworkMonitor(app_manager.RyuApp):
         self.switches = []
         self.links = []
         self.monitor_thread = hub.spawn(self._monitor)
+        
+        # 注册 REST API
         wsgi = kwargs['wsgi']
         wsgi.register(TopologyController, {'network_monitor': self})
 

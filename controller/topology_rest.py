@@ -11,21 +11,24 @@ class TopologyController(ControllerBase):
         switches = []
         links = []
         
-        for switch in self.network_monitor.switches:
-            switches.append({
-                'dpid': switch.dp.id,
-                'ports': [{'port_no': port.port_no} for port in switch.ports]
+        try:
+            for switch in self.network_monitor.switches:
+                switches.append({
+                    'dpid': switch.dp.id,
+                    'ports': [{'port_no': port.port_no} for port in switch.ports]
+                })
+                
+            for link in self.network_monitor.links:
+                links.append({
+                    'src': {'dpid': link.src.dpid, 'port_no': link.src.port_no},
+                    'dst': {'dpid': link.dst.dpid, 'port_no': link.dst.port_no}
+                })
+                
+            body = json.dumps({
+                'switches': switches,
+                'links': links
             })
             
-        for link in self.network_monitor.links:
-            links.append({
-                'src': {'dpid': link.src.dpid, 'port_no': link.src.port_no},
-                'dst': {'dpid': link.dst.dpid, 'port_no': link.dst.port_no}
-            })
-            
-        body = json.dumps({
-            'switches': switches,
-            'links': links
-        })
-        
-        return Response(content_type='application/json', body=body) 
+            return Response(content_type='application/json', body=body)
+        except Exception as e:
+            return Response(status=500, body=str(e)) 

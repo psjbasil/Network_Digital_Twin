@@ -9,11 +9,11 @@ logger = logging.getLogger(__name__)
 class NetworkModel:
     def __init__(self):
         self.graph = nx.Graph()
-        self.controller_url = "http://localhost:8080"
+        self.controller_url = "http://localhost:8080/topology"
 
     def update_topology(self):
         try:
-            response = requests.get(f"{self.controller_url}/topology")
+            response = requests.get(self.controller_url)
             logger.debug(f"Response status: {response.status_code}")
             logger.debug(f"Response content: {response.text}")
             
