@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>网络数字孪生系统</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <style>
+        .topology-view {
+            width: 800px;
+            height: 600px;
+            border: 1px solid #ccc;
+            margin: 20px auto;
+        }
+        .topology-image {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+        }
+    </style>
+</head>
+<body>
+    <h1>网络数字孪生系统</h1>
+    <div class="topology-view">
+        <img id="topology-image" class="topology-image" 
+             src="{{ url_for('static', filename='topology.png') }}" />
+    </div>
+    <script>
+        const socket = io();
+        socket.on('topology_updated', function() {
+            const img = document.getElementById('topology-image');
+            img.src = '/static/topology.png?' + new Date().getTime();
+        });
+    </script>
+</body>
+</html> 
