@@ -35,20 +35,3 @@
   - 交互式操作
 
 ## 项目结构
-/network-digital-twin
-├── physical_network/
-│ ├── topo.py # Mininet拓扑定义
-│ └── custom_topo.py # 自定义拓扑模板
-├── controller/
-│ ├── ryu_app.py # Ryu控制器应用
-│ └── topology_rest.py # REST API实现
-├── digital_twin/
-│ ├── network_model.py # 数字网络模型
-│ └── visualizer.py # 可视化模块
-├── web_interface/
-│ ├── app.py # Flask应用
-│ ├── static/ # 静态资源
-│ └── templates/ # HTML模板
-└── utils/
-├── config.py # 配置文件
-└── monitor.py # 监控更新模块

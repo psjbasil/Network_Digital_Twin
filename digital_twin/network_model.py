@@ -1,53 +1,159 @@
-import networkx as nx
-import json
-import requests
+"""
+网络拓扑模型
+"""
 import logging
-
-logging.basicConfig(level=logging.DEBUG)
-logger = logging.getLogger(__name__)
+from typing import Dict, List, Set, Optional
 
 class NetworkModel:
+    """网络拓扑模型类"""
+    
     def __init__(self):
-        self.graph = nx.Graph()
-        self.controller_url = "http://localhost:8080/topology"
-
-    def update_topology(self):
+        """初始化网络模型"""
+        self.switches: Dict[str, Dict] = {}  # 交换机信息
+        self.hosts: Dict[str, Dict] = {}     # 主机信息
+        self.links: List[Dict] = []          # 链路信息
+        self.port_states: Dict[str, Dict] = {}  # 端口状态
+        self.logger = logging.getLogger(__name__)
+    
+    def update_from_topology(self, topology_data: Dict) -> bool:
+        """
+        从拓扑数据更新模型
+        
+        Args:
+            topology_data: 拓扑数据
+            
+        Returns:
+            bool: 是否发生拓扑变化
+        """
         try:
-            response = requests.get(self.controller_url)
-            logger.debug(f"Response status: {response.status_code}")
-            logger.debug(f"Response content: {response.text}")
+            # 保存旧拓扑用于比较
+            old_switches = self.switches.copy()
+            old_hosts = self.hosts.copy()
+            old_links = self.links.copy()
             
-            if response.status_code != 200:
-                logger.error(f"Failed to get topology: HTTP {response.status_code}")
-                return False
-                
-            topology_data = json.loads(response.text)
+            # 更新交换机信息
+            self.switches = {}
+            for switch in topology_data.get('switches', []):
+                self.switches[switch['dpid']] = {
+                    'dpid': switch['dpid'],
+                    'ports': switch.get('ports', []),
+                    'features': switch.get('features', {})
+                }
             
-            self.graph.clear()
+            # 更新主机信息
+            self.hosts = {}
+            for host in topology_data.get('hosts', []):
+                self.hosts[host['mac']] = {
+                    'mac': host['mac'],
+                    'ip': host.get('ip', ''),
+                    'location': host.get('location', {})
+                }
             
-            # 添加交换机
-            for switch in topology_data['switches']:
-                self.graph.add_node(switch['dpid'], type='switch')
-                
-            # 添加链路
-            for link in topology_data['links']:
-                src = link['src']['dpid']
-                dst = link['dst']['dpid']
-                self.graph.add_edge(src, dst)
-                
-            return True
-        except requests.exceptions.ConnectionError as e:
-            logger.error(f"连接到控制器失败: {str(e)}")
-            return False
-        except json.JSONDecodeError as e:
-            logger.error(f"解析拓扑数据失败: {str(e)}")
-            return False
+            # 更新链路信息
+            self.links = []
+            for link in topology_data.get('links', []):
+                self.links.append({
+                    'source': link['source'],
+                    'target': link['target'],
+                    'source_port': link.get('source_port'),
+                    'target_port': link.get('target_port')
+                })
+            
+            # 更新端口状态
+            self.port_states = {}
+            for switch in topology_data.get('switches', []):
+                dpid = switch['dpid']
+                self.port_states[dpid] = {}
+                for port in switch.get('ports', []):
+                    self.port_states[dpid][port['port_no']] = {
+                        'state': port.get('state', 'down'),
+                        'features': port.get('features', {})
+                    }
+            
+            # 检查拓扑是否发生变化
+            topology_changed = (
+                old_switches != self.switches or
+                old_hosts != self.hosts or
+                old_links != self.links
+            )
+            
+            if topology_changed:
+                self.logger.info("检测到拓扑变化")
+            
+            return topology_changed
+            
         except Exception as e:
-            logger.error(f"更新拓扑失败: {str(e)}")
+            self.logger.error(f"更新拓扑模型失败: {str(e)}")
             return False
-
-    def get_topology(self):
+    
+    def get_topology_data(self) -> Dict:
+        """
+        获取当前拓扑数据
+        
+        Returns:
+            Dict: 拓扑数据
+        """
         return {
-            'nodes': list(self.graph.nodes()),
-            'edges': list(self.graph.edges())
-        } 
+            'switches': [
+                {
+                    'dpid': dpid,
+                    'ports': data['ports'],
+                    'features': data['features']
+                }
+                for dpid, data in self.switches.items()
+            ],
+            'hosts': [
+                {
+                    'mac': mac,
+                    'ip': data['ip'],
+                    'location': data['location']
+                }
+                for mac, data in self.hosts.items()
+            ],
+            'links': self.links.copy()
+        }
+    
+    def is_topology_changed(self, new_topology: Dict) -> bool:
+        """
+        检查拓扑是否发生变化
+        
+        Args:
+            new_topology: 新的拓扑数据
+            
+        Returns:
+            bool: 是否发生变化
+        """
+        try:
+            # 比较交换机
+            new_switches = {
+                switch['dpid']: switch
+                for switch in new_topology.get('switches', [])
+            }
+            if new_switches != self.switches:
+                return True
+            
+            # 比较主机
+            new_hosts = {
+                host['mac']: host
+                for host in new_topology.get('hosts', [])
+            }
+            if new_hosts != self.hosts:
+                return True
+            
+            # 比较链路
+            new_links = set(
+                (link['source'], link['target'])
+                for link in new_topology.get('links', [])
+            )
+            current_links = set(
+                (link['source'], link['target'])
+                for link in self.links
+            )
+            if new_links != current_links:
+                return True
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"检查拓扑变化失败: {str(e)}")
+            return False 
