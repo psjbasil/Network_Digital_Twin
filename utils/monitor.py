@@ -17,11 +17,11 @@ class TopologyMonitor:
                         self.network_model.graph,
                         self.config.TOPOLOGY_IMAGE_PATH
                     )
-                    print("拓扑更新成功")
+                    print("Topology updated successfully")
                 else:
-                    print("拓扑更新失败")
+                    print("Topology update failed")
             except Exception as e:
-                print(f"监控错误: {str(e)}")
+                print(f"Monitoring error: {str(e)}")
                 
             time.sleep(self.config.UPDATE_INTERVAL)
 

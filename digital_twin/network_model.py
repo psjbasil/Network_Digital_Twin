@@ -1,37 +1,37 @@
 """
-网络拓扑模型
+Network Topology Model
 """
 import logging
 from typing import Dict, List, Set, Optional
 
 class NetworkModel:
-    """网络拓扑模型类"""
+    """Network Topology Model Class"""
     
     def __init__(self):
-        """初始化网络模型"""
-        self.switches: Dict[str, Dict] = {}  # 交换机信息
-        self.hosts: Dict[str, Dict] = {}     # 主机信息
-        self.links: List[Dict] = []          # 链路信息
-        self.port_states: Dict[str, Dict] = {}  # 端口状态
+        """Initialize network model"""
+        self.switches: Dict[str, Dict] = {}  # Switch information
+        self.hosts: Dict[str, Dict] = {}     # Host information
+        self.links: List[Dict] = []          # Link information
+        self.port_states: Dict[str, Dict] = {}  # Port state
         self.logger = logging.getLogger(__name__)
     
     def update_from_topology(self, topology_data: Dict) -> bool:
         """
-        从拓扑数据更新模型
+        Update model from topology data
         
         Args:
-            topology_data: 拓扑数据
+            topology_data: Topology data
             
         Returns:
-            bool: 是否发生拓扑变化
+            bool: Whether topology has changed
         """
         try:
-            # 保存旧拓扑用于比较
+            # Save old topology for comparison
             old_switches = self.switches.copy()
             old_hosts = self.hosts.copy()
             old_links = self.links.copy()
             
-            # 更新交换机信息
+            # Update switch information
             self.switches = {}
             for switch in topology_data.get('switches', []):
                 self.switches[switch['dpid']] = {
@@ -40,7 +40,7 @@ class NetworkModel:
                     'features': switch.get('features', {})
                 }
             
-            # 更新主机信息
+            # Update host information
             self.hosts = {}
             for host in topology_data.get('hosts', []):
                 self.hosts[host['mac']] = {
@@ -49,7 +49,7 @@ class NetworkModel:
                     'location': host.get('location', {})
                 }
             
-            # 更新链路信息
+            # Update link information
             self.links = []
             for link in topology_data.get('links', []):
                 self.links.append({
@@ -59,7 +59,7 @@ class NetworkModel:
                     'target_port': link.get('target_port')
                 })
             
-            # 更新端口状态
+            # Update port state
             self.port_states = {}
             for switch in topology_data.get('switches', []):
                 dpid = switch['dpid']
@@ -70,7 +70,7 @@ class NetworkModel:
                         'features': port.get('features', {})
                     }
             
-            # 检查拓扑是否发生变化
+            # Check if topology has changed
             topology_changed = (
                 old_switches != self.switches or
                 old_hosts != self.hosts or
@@ -78,20 +78,20 @@ class NetworkModel:
             )
             
             if topology_changed:
-                self.logger.info("检测到拓扑变化")
+                self.logger.info("Topology change detected")
             
             return topology_changed
             
         except Exception as e:
-            self.logger.error(f"更新拓扑模型失败: {str(e)}")
+            self.logger.error(f"Failed to update topology model: {str(e)}")
             return False
     
     def get_topology_data(self) -> Dict:
         """
-        获取当前拓扑数据
+        Get current topology data
         
         Returns:
-            Dict: 拓扑数据
+            Dict: Topology data
         """
         return {
             'switches': [
@@ -115,16 +115,16 @@ class NetworkModel:
     
     def is_topology_changed(self, new_topology: Dict) -> bool:
         """
-        检查拓扑是否发生变化
+        Check if topology has changed
         
         Args:
-            new_topology: 新的拓扑数据
+            new_topology: New topology data
             
         Returns:
-            bool: 是否发生变化
+            bool: Whether topology has changed
         """
         try:
-            # 比较交换机
+            # Compare switches
             new_switches = {
                 switch['dpid']: switch
                 for switch in new_topology.get('switches', [])
@@ -132,7 +132,7 @@ class NetworkModel:
             if new_switches != self.switches:
                 return True
             
-            # 比较主机
+            # Compare hosts
             new_hosts = {
                 host['mac']: host
                 for host in new_topology.get('hosts', [])
@@ -140,7 +140,7 @@ class NetworkModel:
             if new_hosts != self.hosts:
                 return True
             
-            # 比较链路
+            # Compare links
             new_links = set(
                 (link['source'], link['target'])
                 for link in new_topology.get('links', [])
@@ -155,5 +155,5 @@ class NetworkModel:
             return False
             
         except Exception as e:
-            self.logger.error(f"检查拓扑变化失败: {str(e)}")
+            self.logger.error(f"Failed to check topology changes: {str(e)}")
             return False 

@@ -6,168 +6,165 @@ import threading
 import time
 import logging
 
-# 添加项目根目录到 Python 路径
+# Add project root directory to Python path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 
-from flask import Flask, render_template, send_from_directory
+from flask import Flask, render_template, send_from_directory, jsonify, request
 from flask_socketio import SocketIO, emit
 from digital_twin.network_model import NetworkModel
 from digital_twin.visualizer import NetworkVisualizer
+from werkzeug.serving import WSGIRequestHandler
 
-# 配置日志
-logging.basicConfig(level=logging.INFO)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S'
+)
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*")
+# Set log level to WARNING or ERROR for other modules
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
+logging.getLogger('engineio').setLevel(logging.ERROR)
+logging.getLogger('socketio').setLevel(logging.ERROR)
+logging.getLogger('geventwebsocket').setLevel(logging.ERROR)
+
+app = Flask(__name__, 
+            static_folder='static',
+            static_url_path='/static')
+
+# Optimize SocketIO configuration
+socketio = SocketIO(
+    app,
+    cors_allowed_origins="*",
+    async_mode='gevent',  # Use gevent as async mode
+    ping_timeout=10,
+    ping_interval=5,
+    max_http_buffer_size=1024 * 1024,  # Increase buffer size
+    logger=False,  # Disable SocketIO internal logging
+    engineio_logger=False  # Disable Engine.IO internal logging
+)
+
 network_model = NetworkModel()
 visualizer = NetworkVisualizer()
 
-# 确保static目录存在
+# Ensure static directory exists
 os.makedirs('web_interface/static', exist_ok=True)
 
 class TopologyUpdater:
-    _instance = None  # 单例模式
+    _instance = None
+    _lock = threading.Lock()
     
     def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+            return cls._instance
     
-    def __init__(self, interval=5):
+    def __init__(self):
         if not hasattr(self, 'initialized'):
-            self.interval = interval
+            self.error_count = 0
+            self.max_errors = 3
+            self.base_interval = 0.1
+            self.max_interval = 0.5
+            self.current_interval = self.base_interval
             self.controller_url = "http://localhost:8080/topology"
             self.last_topology = None
-            self.retry_count = 0
-            self.max_retries = 3
-            self.retry_interval = 1  # 重试间隔（秒）
-            self.thread = threading.Thread(target=self._update_loop, daemon=True)
-            self.thread.start()
+            self.last_topology_hash = None
+            self.last_hosts_state = {}  # Add host state tracking
+            self._lock = threading.Lock()
             self.initialized = True
-            self.last_update_time = time.time()
-            self.update_count = 0
-            self.error_count = 0
+            
+            self.update_thread = threading.Thread(target=self._update_loop, daemon=True)
+            self.update_thread.start()
+            
+            self.heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+            self.heartbeat_thread.start()
 
     def _get_topology(self):
-        """获取拓扑数据"""
         try:
-            response = requests.get(self.controller_url, timeout=5)  # 添加超时
+            response = requests.get(self.controller_url, timeout=1)  # Reduce timeout
             if response.status_code == 200:
-                topology = response.json()
-                self.retry_count = 0
-                self.error_count = 0
-                self.last_topology = topology
-                self.last_update_time = time.time()
-                self.update_count += 1
-                return topology
+                return response.json()
             elif response.status_code == 204 and self.last_topology:
-                logger.debug("Using cached topology data")
                 return self.last_topology
             else:
-                # 强制获取拓扑数据
-                response = requests.get(self.controller_url + "?force=true", timeout=5)
-                if response.status_code == 200:
-                    topology = response.json()
-                    self.last_topology = topology
-                    self.last_update_time = time.time()
-                    self.update_count += 1
-                    return topology
-                logger.error(f"Failed to get topology: HTTP {response.status_code}")
-                self.error_count += 1
-                return None
-        except requests.Timeout:
-            logger.error("Timeout while getting topology")
-            self.error_count += 1
-            return None
+                response = requests.get(self.controller_url + "?force=true", timeout=1)
+                return response.json() if response.status_code == 200 else None
         except Exception as e:
-            logger.error(f"Error getting topology: {str(e)}")
-            self.error_count += 1
+            logger.error(f"Error getting topology data: {str(e)}")
             return None
+
+    def _get_topology_hash(self, topology):
+        """Calculate hash of topology data, excluding host IP addresses"""
+        if not topology:
+            return None
+        
+        # Create a copy of topology data, remove host IP information
+        topology_copy = json.loads(json.dumps(topology))
+        if 'hosts' in topology_copy:
+            for host in topology_copy['hosts']:
+                if 'ip' in host:
+                    del host['ip']
+        
+        return hash(json.dumps(topology_copy, sort_keys=True))
+
+    def _check_hosts_changes(self, topology):
+        """Check if host IPs have changed"""
+        if not topology or 'hosts' not in topology:
+            return False
+        
+        current_hosts_state = {
+            host['mac']: host.get('ip', '')
+            for host in topology['hosts']
+        }
+        
+        has_changes = current_hosts_state != self.last_hosts_state
+        self.last_hosts_state = current_hosts_state
+        return has_changes
+
+    def _emit_topology_update(self, topology_data, current_hash):
+        """Thread-safe topology update emission"""
+        with self._lock:
+            hosts_changed = self._check_hosts_changes(topology_data)
+            topology_changed = current_hash != self.last_topology_hash
+            
+            if topology_changed or hosts_changed:
+                socketio.emit('topology_update', {
+                    'topology': topology_data,
+                    'timestamp': time.time()
+                }, namespace='/')
+                self.last_topology = topology_data
+                self.last_topology_hash = current_hash
+                if hosts_changed:
+                    logger.debug("Detected host IP changes, update sent")
+                else:
+                    logger.debug("Detected topology changes, update sent")
 
     def _update_loop(self):
         while True:
             try:
-                # 动态调整更新间隔
-                current_interval = self._calculate_update_interval()
-                
-                topology = self._get_topology()
-                if topology:
-                    if topology != self.last_topology:
-                        logger.info("检测到拓扑变化")
-                        logger.debug(f"新拓扑数据: {json.dumps(topology, indent=2)}")
-                        # 发送带有变化类型的拓扑更新
-                        changes = self._detect_topology_changes(self.last_topology, topology)
-                        socketio.emit('topology_update', {
-                            'topology': topology,
-                            'changes': changes,
-                            'timestamp': time.time()
-                        })
-                        logger.info("拓扑数据已发送到前端")
-                        self.last_topology = topology
-                        self.retry_count = 0
-                    else:
-                        logger.debug("拓扑数据未变化")
-                else:
-                    self.retry_count += 1
-                    if self.retry_count >= self.max_retries:
-                        logger.warning("达到最大重试次数，等待更长时间后重试")
-                        time.sleep(self.retry_interval * 2)
-                        self.retry_count = 0
+                topology_data = self._get_topology()
+                if topology_data:
+                    current_hash = self._get_topology_hash(topology_data)
+                    self._emit_topology_update(topology_data, current_hash)
+                time.sleep(self.base_interval)
             except Exception as e:
                 logger.error(f"Update loop error: {str(e)}")
-                self.error_count += 1
-            
-            time.sleep(current_interval)
+                time.sleep(self.current_interval)
 
-    def _calculate_update_interval(self):
-        """动态计算更新间隔"""
-        base_interval = self.interval
-        
-        # 根据错误率调整间隔
-        if self.error_count > 10:
-            return base_interval * 2
-        elif self.error_count > 5:
-            return base_interval * 1.5
-        
-        # 根据更新频率调整间隔
-        time_since_last_update = time.time() - self.last_update_time
-        if time_since_last_update > 300:  # 5分钟没有更新
-            return base_interval * 0.5  # 更频繁地检查
-        
-        return base_interval
-
-    def _detect_topology_changes(self, old_topology, new_topology):
-        """检测拓扑变化的具体内容"""
-        if not old_topology:
-            return {'type': 'initial'}
-        
-        changes = {
-            'added': {'switches': [], 'hosts': [], 'links': []},
-            'removed': {'switches': [], 'hosts': [], 'links': []},
-            'modified': {'switches': [], 'hosts': [], 'links': []}
-        }
-        
-        # 检测交换机变化
-        old_switches = {f"s{sw['dpid']}" for sw in old_topology.get('switches', [])}
-        new_switches = {f"s{sw['dpid']}" for sw in new_topology.get('switches', [])}
-        changes['added']['switches'] = list(new_switches - old_switches)
-        changes['removed']['switches'] = list(old_switches - new_switches)
-        
-        # 检测主机变化
-        old_hosts = {h['mac'] for h in old_topology.get('hosts', [])}
-        new_hosts = {h['mac'] for h in new_topology.get('hosts', [])}
-        changes['added']['hosts'] = list(new_hosts - old_hosts)
-        changes['removed']['hosts'] = list(old_hosts - new_hosts)
-        
-        # 检测链路变化
-        old_links = {(l['src']['dpid'], l['dst']['dpid']) for l in old_topology.get('links', [])}
-        new_links = {(l['src']['dpid'], l['dst']['dpid']) for l in new_topology.get('links', [])}
-        changes['added']['links'] = list(new_links - old_links)
-        changes['removed']['links'] = list(old_links - new_links)
-        
-        return changes
+    def _heartbeat_loop(self):
+        """Keep WebSocket connection alive"""
+        while True:
+            try:
+                socketio.sleep(5)
+                if self.last_topology:
+                    socketio.emit('heartbeat', {'timestamp': time.time()})
+                    logger.debug("Sending heartbeat")
+            except Exception as e:
+                logger.error(f"Heartbeat error: {str(e)}")
+                time.sleep(1)
 
 @app.route('/')
 def index():
@@ -179,34 +176,81 @@ def serve_static(filename):
 
 @socketio.on('connect')
 def handle_connect():
-    """处理客户端连接"""
+    """Handle client connection"""
     logger.info("Client connected")
     try:
         updater = TopologyUpdater()
         topology = updater._get_topology()
         if topology:
-            # 发送初始拓扑数据
-            socketio.emit('topology_update', {
-                'topology': topology,
-                'changes': {'type': 'initial'}
-            })
-            logger.info("Initial topology sent to client")
+            current_hash = updater._get_topology_hash(topology)
+            updater._emit_topology_update(topology, current_hash)
         else:
-            # 尝试强制获取拓扑
+            # Try to force get topology
             response = requests.get(updater.controller_url + "?force=true")
             if response.status_code == 200:
                 topology = response.json()
-                socketio.emit('topology_update', {
-                    'topology': topology,
-                    'changes': {'type': 'initial'}
-                })
+                updater._emit_topology_update(topology, updater._get_topology_hash(topology))
                 updater.last_topology = topology
                 logger.info("Initial topology sent to client (forced)")
             else:
                 logger.error("Failed to get initial topology")
     except Exception as e:
-        logger.error(f"Error sending initial topology: {str(e)}")
+        logger.error(f"Error sending initial topology data: {str(e)}")
+
+@app.route('/topology')
+def get_topology():
+    """Get topology data"""
+    try:
+        updater = TopologyUpdater()
+        topology = updater._get_topology()
+        if topology:
+            return jsonify(topology)
+        else:
+            # Try to force get topology
+            response = requests.get(updater.controller_url + "?force=true")
+            if response.status_code == 200:
+                topology = response.json()
+                updater._emit_topology_update(topology, updater._get_topology_hash(topology))
+                updater.last_topology = topology
+                return jsonify(topology)
+            else:
+                return jsonify({'error': 'Failed to get topology'}), 404
+    except Exception as e:
+        logger.error(f"Error getting topology: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@socketio.on('request_topology')
+def handle_topology_request():
+    """Handle client topology request"""
+    try:
+        updater = TopologyUpdater()
+        topology = updater._get_topology()
+        if topology:
+            current_hash = updater._get_topology_hash(topology)
+            updater._emit_topology_update(topology, current_hash)
+        else:
+            # Try to force get topology
+            response = requests.get(updater.controller_url + "?force=true")
+            if response.status_code == 200:
+                topology = response.json()
+                updater._emit_topology_update(topology, updater._get_topology_hash(topology))
+                updater.last_topology = topology
+                logger.info("Initial topology sent to client (forced)")
+            else:
+                logger.error("Failed to get initial topology")
+    except Exception as e:
+        logger.error(f"Error handling topology request: {str(e)}")
+        emit('topology_error', {'message': str(e)})
 
 if __name__ == '__main__':
+    WSGIRequestHandler.protocol_version = "HTTP/1.1"
     updater = TopologyUpdater()
-    socketio.run(app, host='0.0.0.0', port=5000, debug=True) 
+    # Run server with gevent
+    socketio.run(
+        app,
+        host='0.0.0.0',
+        port=5000,
+        debug=False,  # Disable debug mode
+        use_reloader=False,
+        log_output=False  # Disable HTTP request logging
+    ) 

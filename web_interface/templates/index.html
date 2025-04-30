@@ -1,28 +1,30 @@
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>网络数字孪生系统</title>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/dist/dist/vis-network.min.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Network Digital Twin System</title>
+    
+    <!-- Import D3.js -->
+    <script src="https://d3js.org/d3.v7.min.js"></script>
+    
+    <!-- Import Socket.IO -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    
+    <!-- Import custom styles and scripts -->
     <link rel="stylesheet" href="/static/css/style.css">
-    <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.2/dist/vis-network.min.js"></script>
-    <script type="text/javascript" src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
 </head>
 <body>
-    <h1>网络数字孪生系统</h1>
-    <div id="network-container">
-        <div id="network-topology"></div>
+    <div class="container">
+        <div class="header">
+            <h1>Network Digital Twin System</h1>
+        </div>
+        <div id="network">
+            <svg width="100%" height="100%"></svg>
+        </div>
     </div>
-    <div id="error-message" style="color: red; text-align: center; display: none;"></div>
+    
+    <!-- Import topology script -->
     <script src="/static/js/topology.js"></script>
-    <script>
-        window.onerror = function(msg, url, line, col, error) {
-            console.error('Error:', error);
-            const errorMessage = document.getElementById('error-message');
-            errorMessage.textContent = `Error: ${msg} (Line: ${line})`;
-            errorMessage.style.display = 'block';
-            return false;
-        };
-    </script>
 </body>
 </html> 
