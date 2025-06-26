@@ -1,4 +1,10 @@
+"""
+Configuration constants for Network Digital Twin System
+"""
+
 class Config:
+    """Configuration class with system constants"""
+    
     # Ryu controller configuration
     RYU_CONTROLLER_HOST = "127.0.0.1"
     RYU_CONTROLLER_PORT = 6653
@@ -8,8 +14,6 @@ class Config:
     WEB_HOST = "0.0.0.0"
     WEB_PORT = 5000
     
-    # Update interval (seconds)
-    UPDATE_INTERVAL = 10
-    
-    # Static file path
-    TOPOLOGY_IMAGE_PATH = "web_interface/static/topology.png" 
+    # Update intervals (seconds)
+    TOPOLOGY_UPDATE_INTERVAL = 1
+    TRAFFIC_UPDATE_INTERVAL = 2 

@@ -8,6 +8,16 @@ const socket = io({
     timeout: 5000              // Connection timeout
 });
 
+// Traffic monitoring variables
+let trafficDisplay = false;
+let maxThroughput = 1000000; // Default 1 Mbps for scaling
+
+// Update throttling variables
+let isUpdating = false;
+let pendingUpdate = false;
+let lastUpdateTime = 0;
+const UPDATE_THROTTLE_MS = 1000; // Minimum 1 second between updates
+
 // Create force-directed graph layout
 let svg = d3.select('#network svg');
 let width = svg.node().getBoundingClientRect().width;
@@ -101,6 +111,30 @@ function updateTopology(data) {
         return;
     }
     
+    // Throttle updates to prevent excessive refreshing
+    const currentTime = Date.now();
+    if (isUpdating) {
+        pendingUpdate = true;
+        return;
+    }
+    
+    if (currentTime - lastUpdateTime < UPDATE_THROTTLE_MS) {
+        // Schedule delayed update
+        if (!pendingUpdate) {
+            pendingUpdate = true;
+            setTimeout(() => {
+                if (pendingUpdate) {
+                    pendingUpdate = false;
+                    updateTopology(data);
+                }
+            }, UPDATE_THROTTLE_MS - (currentTime - lastUpdateTime));
+        }
+        return;
+    }
+    
+    isUpdating = true;
+    lastUpdateTime = currentTime;
+    
     const topology = data.topology;
     let nodes = [];
     const links = [];
@@ -153,6 +187,12 @@ function updateTopology(data) {
                         vx: existingNode ? existingNode.vx : undefined,
                         vy: existingNode ? existingNode.vy : undefined
                     };
+                    
+                    // Add traffic information if available
+                    if (host.traffic) {
+                        nodeData.traffic = host.traffic;
+                    }
+                    
                     nodes.push(nodeData);
                     processedNodes.add(host.mac);
                 }
@@ -163,11 +203,19 @@ function updateTopology(data) {
         if (Array.isArray(topology.links)) {
             topology.links.forEach(link => {
                 if (link && link.src && link.dst && link.src.dpid && link.dst.dpid) {
-                    links.push({
+                    const linkData = {
                         source: `s${link.src.dpid}`,
                         target: `s${link.dst.dpid}`,
-                        title: `Port ${link.src.port_no} -> Port ${link.dst.port_no}`
-                    });
+                        title: `Port ${link.src.port_no} -> Port ${link.dst.port_no}`,
+                        type: 'switch-switch'
+                    };
+                    
+                    // Add traffic information if available
+                    if (link.total_throughput !== undefined) {
+                        linkData.total_throughput = link.total_throughput;
+                    }
+                    
+                    links.push(linkData);
                 }
             });
         }
@@ -182,11 +230,20 @@ function updateTopology(data) {
                                 /^(\d{1,3}\.){3}\d{1,3}$/.test(host.ip);
 
                 if (isValidIP && host.mac && host.dpid) {
-                    links.push({
+                    const linkData = {
                         source: host.mac,
                         target: `s${host.dpid}`,
-                        title: `Port ${host.port || 'unknown'}`
-                    });
+                        title: `Port ${host.port || 'unknown'}`,
+                        type: 'host-switch'
+                    };
+                    
+                    // Add traffic information if available
+                    if (host.traffic) {
+                        const hostThroughput = (host.traffic.rx_throughput || 0) + (host.traffic.tx_throughput || 0);
+                        linkData.total_throughput = hostThroughput;
+                    }
+                    
+                    links.push(linkData);
                 }
             });
         }
@@ -196,13 +253,16 @@ function updateTopology(data) {
             initSimulation();
         }
 
+        // Update global max throughput for scaling
+        updateMaxThroughput(topology);
+
         // Update links
         const link = container.selectAll('.link')
             .data(links, d => `${d.source}-${d.target}`);
 
         // Remove obsolete links
         link.exit().transition()
-            .duration(500)
+            .duration(200)
             .style('opacity', 0)
             .remove();
 
@@ -212,8 +272,11 @@ function updateTopology(data) {
             .attr('class', 'link')
             .attr('marker-end', 'url(#arrowhead)')
             .style('opacity', 0)
+            .style('stroke', '#666')
+            .style('stroke-width', 2)
+            .style('fill', 'none')
             .transition()
-            .duration(500)
+            .duration(200)
             .style('opacity', 1);
 
         // Update nodes
@@ -222,7 +285,7 @@ function updateTopology(data) {
 
         // Remove obsolete nodes
         node.exit().transition()
-            .duration(500)
+            .duration(200)
             .style('opacity', 0)
             .remove();
 
@@ -253,7 +316,7 @@ function updateTopology(data) {
 
         // Fade in new nodes
         nodeEnter.transition()
-            .duration(500)
+            .duration(200)
             .style('opacity', 1);
 
         // Update all nodes (existing and new) text and titles
@@ -284,8 +347,13 @@ function updateTopology(data) {
         simulation.nodes(nodes);
         simulation.force('link').links(links);
         
-        // Restart simulation with lower alpha
-        simulation.alpha(0.3).restart();
+        // Update traffic visualization after nodes and links are updated
+        setTimeout(() => {
+            updateTrafficVisualization();
+        }, 100);
+        
+        // Restart simulation with lower alpha to reduce oscillation
+        simulation.alpha(0.1).restart();
         
         // Update tick event handler
         simulation.on('tick', () => {
@@ -319,6 +387,15 @@ function updateTopology(data) {
 
     } catch (error) {
         console.error('Error updating topology:', error);
+    } finally {
+        // Reset update throttling flag
+        isUpdating = false;
+        
+        // Process pending update if any
+        if (pendingUpdate) {
+            pendingUpdate = false;
+            setTimeout(() => requestTopologyUpdate(), 100);
+        }
     }
 }
 
@@ -343,25 +420,25 @@ socket.on('topology_update', (data) => {
         return;
     }
     
-    requestAnimationFrame(() => {
-        updateTopology(data);
-    });
+    // Use throttled update for WebSocket events too
+    updateTopology(data);
 });
 
-// Listen for heartbeat
+// Listen for heartbeat - reduce frequency
 socket.on('heartbeat', (data) => {
-    requestTopologyUpdate();
+    // Only request update every few heartbeats to reduce load
+    if (Math.random() < 0.3) { // 30% chance to update on heartbeat
+        requestTopologyUpdate();
+    }
 });
 
 // Connection established handler
 socket.on('connect', () => {
-    console.log('WebSocket connection established');
     requestTopologyUpdate();
 });
 
 // Connection lost handler
 socket.on('disconnect', () => {
-    console.log('WebSocket connection lost');
     clearTopology();
 });
 
@@ -385,8 +462,8 @@ function requestTopologyUpdate() {
     }
 }
 
-// Set shorter polling interval
-const updateInterval = setInterval(requestTopologyUpdate, 200);
+// Set reasonable polling interval (reduced from 200ms to 2000ms)
+const updateInterval = setInterval(requestTopologyUpdate, 2000);
 
 // Cleanup on page unload
 window.addEventListener('beforeunload', () => {
@@ -405,9 +482,179 @@ document.addEventListener('visibilitychange', () => {
 
 // Network online handler
 window.addEventListener('online', () => {
-    console.log('Network connection restored');
     requestTopologyUpdate();
 });
 
 // Initialize view position
 svg.call(zoom.transform, d3.zoomIdentity.translate(centerX, centerY).scale(0.6));
+
+// Traffic monitoring functions
+function updateMaxThroughput(topology) {
+    let currentMax = 0;
+    
+    // Check link throughput
+    if (Array.isArray(topology.links)) {
+        topology.links.forEach(link => {
+            if (link.total_throughput) {
+                currentMax = Math.max(currentMax, link.total_throughput);
+            }
+        });
+    }
+    
+    // Check host throughput
+    if (Array.isArray(topology.hosts)) {
+        topology.hosts.forEach(host => {
+            if (host.traffic) {
+                const hostThroughput = (host.traffic.rx_throughput || 0) + (host.traffic.tx_throughput || 0);
+                currentMax = Math.max(currentMax, hostThroughput);
+            }
+        });
+    }
+    
+    // Update max throughput for scaling (with minimum threshold)
+    maxThroughput = Math.max(currentMax, 1000000); // At least 1 Mbps
+}
+
+function formatThroughput(throughput) {
+    if (throughput >= 1000000000) {
+        return `${(throughput / 1000000000).toFixed(2)} Gbps`;
+    } else if (throughput >= 1000000) {
+        return `${(throughput / 1000000).toFixed(2)} Mbps`;
+    } else if (throughput >= 1000) {
+        return `${(throughput / 1000).toFixed(2)} Kbps`;
+    } else {
+        return `${throughput.toFixed(2)} bps`;
+    }
+}
+
+function getTrafficColor(throughput) {
+    // Color gradient from green (low) to red (high)
+    const ratio = Math.min(throughput / maxThroughput, 1);
+    const red = Math.floor(255 * ratio);
+    const green = Math.floor(255 * (1 - ratio));
+    return `rgb(${red}, ${green}, 0)`;
+}
+
+function getTrafficWidth(throughput) {
+    // Scale line width based on throughput (1px to 10px)
+    const ratio = Math.min(throughput / maxThroughput, 1);
+    return Math.max(1, ratio * 8) + 1;
+}
+
+function toggleTrafficDisplay() {
+    trafficDisplay = !trafficDisplay;
+    const button = document.getElementById('traffic-toggle');
+    if (button) {
+        button.textContent = trafficDisplay ? 'Hide Traffic' : 'Show Traffic';
+        button.className = trafficDisplay ? 'btn btn-warning' : 'btn btn-success';
+    }
+    
+    // Update visualization
+    updateTrafficVisualization();
+}
+
+function updateTrafficVisualization() {
+    // Update link colors and widths based on traffic
+    container.selectAll('.link')
+        .style('stroke', function(d) {
+            if (trafficDisplay && d.total_throughput) {
+                return getTrafficColor(d.total_throughput);
+            }
+            return '#666';
+        })
+        .style('stroke-width', function(d) {
+            if (trafficDisplay && d.total_throughput) {
+                return getTrafficWidth(d.total_throughput);
+            }
+            return 2;
+        });
+    
+    // Update node colors based on traffic
+    container.selectAll('.node')
+        .style('fill', function(d) {
+            if (trafficDisplay && d.type === 'host' && d.traffic) {
+                const hostThroughput = (d.traffic.rx_throughput || 0) + (d.traffic.tx_throughput || 0);
+                if (hostThroughput > 0) {
+                    return getTrafficColor(hostThroughput);
+                }
+            }
+            return d.type === 'switch' ? '#4682b4' : '#ff6b6b';
+        });
+}
+
+function showTrafficStats() {
+    // Create traffic statistics panel
+    const statsPanel = document.getElementById('traffic-stats');
+    if (!statsPanel) {
+        const panel = document.createElement('div');
+        panel.id = 'traffic-stats';
+        panel.className = 'traffic-stats-panel';
+        panel.style.cssText = `
+            position: fixed;
+            top: 50px;
+            right: 20px;
+            width: 300px;
+            background: white;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            padding: 15px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            z-index: 1000;
+            display: none;
+        `;
+        panel.innerHTML = `
+            <h3 style="margin-top: 0;">Traffic Statistics</h3>
+            <div id="stats-content">Loading...</div>
+            <button onclick="hideTrafficStats()" style="margin-top: 10px; padding: 5px 10px;">Close</button>
+        `;
+        document.body.appendChild(panel);
+    }
+    
+    // Fetch and display traffic statistics
+    fetch('/traffic/summary')
+        .then(response => {
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+            return response.json();
+        })
+        .then(data => {
+            const content = document.getElementById('stats-content');
+            if (content) {
+                if (data.error) {
+                    content.innerHTML = `<p style="color: red;">Error: ${data.error}</p>`;
+                } else {
+                    content.innerHTML = `
+                        <p><strong>Total Throughput:</strong> ${formatThroughput(data.total_throughput || 0)}</p>
+                        <p><strong>Total Packets:</strong> ${(data.total_packets || 0).toLocaleString()}</p>
+                        <p><strong>Total Bytes:</strong> ${(data.total_bytes || 0).toLocaleString()}</p>
+                        <p><strong>Active Switches:</strong> ${data.num_switches || 0}</p>
+                        <p><strong>Active Flows:</strong> ${data.num_flows || 0}</p>
+                        <p><strong>Last Updated:</strong> ${new Date((data.timestamp || Date.now() / 1000) * 1000).toLocaleString()}</p>
+                    `;
+                }
+            }
+        })
+        .catch(error => {
+            console.error('Error fetching traffic statistics:', error);
+            const content = document.getElementById('stats-content');
+            if (content) {
+                content.innerHTML = `
+                    <p style="color: red;">Failed to load traffic statistics</p>
+                    <p style="font-size: 12px; color: #666;">
+                        Make sure the Ryu controller is running on port 8080 and the traffic monitoring features are enabled.
+                    </p>
+                    <p style="font-size: 12px; color: #666;">Error: ${error.message}</p>
+                `;
+            }
+        });
+    
+    statsPanel.style.display = 'block';
+}
+
+function hideTrafficStats() {
+    const statsPanel = document.getElementById('traffic-stats');
+    if (statsPanel) {
+        statsPanel.style.display = 'none';
+    }
+}

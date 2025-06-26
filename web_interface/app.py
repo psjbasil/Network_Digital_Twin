@@ -10,10 +10,8 @@ import logging
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
 
-from flask import Flask, render_template, send_from_directory, jsonify, request
+from flask import Flask, render_template, send_from_directory, jsonify
 from flask_socketio import SocketIO, emit
-from digital_twin.network_model import NetworkModel
-from digital_twin.visualizer import NetworkVisualizer
 from werkzeug.serving import WSGIRequestHandler
 
 # Configure logging
@@ -24,11 +22,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Set log level to WARNING or ERROR for other modules
-logging.getLogger('werkzeug').setLevel(logging.WARNING)
-logging.getLogger('engineio').setLevel(logging.ERROR)
-logging.getLogger('socketio').setLevel(logging.ERROR)
-logging.getLogger('geventwebsocket').setLevel(logging.ERROR)
+# Set log levels to suppress frequent access logs - simple approach
+logging.getLogger('werkzeug').setLevel(logging.WARNING)  # Only warnings/errors
+logging.getLogger('engineio').setLevel(logging.WARNING)
+logging.getLogger('socketio').setLevel(logging.WARNING)
+logging.getLogger('geventwebsocket').setLevel(logging.WARNING)
 
 app = Flask(__name__, 
             static_folder='static',
@@ -46,11 +44,11 @@ socketio = SocketIO(
     engineio_logger=False  # Disable Engine.IO internal logging
 )
 
-network_model = NetworkModel()
-visualizer = NetworkVisualizer()
-
 # Ensure static directory exists
 os.makedirs('web_interface/static', exist_ok=True)
+
+# Controller configuration
+controller_base_url = "http://localhost:8080"
 
 class TopologyUpdater:
     _instance = None
@@ -138,9 +136,11 @@ class TopologyUpdater:
                 self.last_topology = topology_data
                 self.last_topology_hash = current_hash
                 if hosts_changed:
-                    logger.debug("Detected host IP changes, update sent")
+                    # Removed frequent host IP change log
+                    pass
                 else:
-                    logger.debug("Detected topology changes, update sent")
+                    # Removed frequent topology change log
+                    pass
 
     def _update_loop(self):
         while True:
@@ -161,7 +161,7 @@ class TopologyUpdater:
                 socketio.sleep(5)
                 if self.last_topology:
                     socketio.emit('heartbeat', {'timestamp': time.time()})
-                    logger.debug("Sending heartbeat")
+                    # Removed frequent heartbeat log
             except Exception as e:
                 logger.error(f"Heartbeat error: {str(e)}")
                 time.sleep(1)
@@ -177,7 +177,7 @@ def serve_static(filename):
 @socketio.on('connect')
 def handle_connect():
     """Handle client connection"""
-    logger.info("Client connected")
+    # Client connection events are too frequent for logging
     try:
         updater = TopologyUpdater()
         topology = updater._get_topology()
@@ -217,6 +217,40 @@ def get_topology():
                 return jsonify({'error': 'Failed to get topology'}), 404
     except Exception as e:
         logger.error(f"Error getting topology: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/traffic')
+def get_traffic():
+    """Get traffic statistics data"""
+    try:
+        response = requests.get(f"{controller_base_url}/traffic", timeout=5)
+        if response.status_code == 200:
+            return jsonify(response.json())
+        else:
+            logger.error(f"Controller traffic API returned status {response.status_code}")
+            return jsonify({'error': f'Controller returned status {response.status_code}'}), response.status_code
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error connecting to controller traffic API: {str(e)}")
+        return jsonify({'error': 'Failed to connect to controller', 'details': str(e)}), 503
+    except Exception as e:
+        logger.error(f"Error getting traffic data: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/traffic/summary')
+def get_traffic_summary():
+    """Get traffic summary statistics"""
+    try:
+        response = requests.get(f"{controller_base_url}/traffic/summary", timeout=5)
+        if response.status_code == 200:
+            return jsonify(response.json())
+        else:
+            logger.error(f"Controller traffic summary API returned status {response.status_code}")
+            return jsonify({'error': f'Controller returned status {response.status_code}'}), response.status_code
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error connecting to controller traffic summary API: {str(e)}")
+        return jsonify({'error': 'Failed to connect to controller', 'details': str(e)}), 503
+    except Exception as e:
+        logger.error(f"Error getting traffic summary: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
 @socketio.on('request_topology')

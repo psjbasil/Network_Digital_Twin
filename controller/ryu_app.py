@@ -11,27 +11,66 @@ from ryu.lib.packet import packet, ethernet, ether_types, lldp, arp, ipv4
 import json
 import logging
 import time
+import os
 
-# Configure logging
+# Import the external REST API controller
+try:
+    # Try relative import first (when run as part of a package)
+    from .topology_rest import TopologyController
+except ImportError:
+    # Fall back to absolute import (when run directly)
+    try:
+        from topology_rest import TopologyController
+    except ImportError:
+        # If both fail, try importing from controller package
+        import sys
+        import os
+        
+        # Add the controller directory to Python path
+        controller_dir = os.path.dirname(os.path.abspath(__file__))
+        if controller_dir not in sys.path:
+            sys.path.insert(0, controller_dir)
+        
+        from topology_rest import TopologyController
+
+# Configure logging - keep it simple
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
+# Simply set log levels to suppress frequent access logs
+logging.getLogger('werkzeug').setLevel(logging.WARNING)  # Only show warnings/errors
+logging.getLogger('socketio').setLevel(logging.WARNING)
+logging.getLogger('engineio').setLevel(logging.WARNING) 
+logging.getLogger('gevent').setLevel(logging.WARNING)
+
+# Suppress Ryu's WSGI server access logs
+logging.getLogger('ryu.app.wsgi').setLevel(logging.WARNING)
+logging.getLogger('ryu.lib.hub').setLevel(logging.WARNING)
+logging.getLogger('ryu').setLevel(logging.INFO)  # Keep general Ryu logs at INFO level
+
+# Additional WSGI server loggers that might produce access logs
+import wsgiref.simple_server
+wsgiref.simple_server.ServerHandler.log_message = lambda self, format, *args: None
+
+# Suppress more potential log sources
+logging.getLogger('eventlet.wsgi.server').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('requests').setLevel(logging.WARNING)
+
+# Override potential access logging methods
+try:
+    from ryu.app.wsgi import WSGIApplication
+    # Monkey patch to disable access logging if possible
+    original_log_request = getattr(WSGIApplication, 'log_request', None)
+    if original_log_request:
+        WSGIApplication.log_request = lambda self, *args, **kwargs: None
+except:
+    pass
+
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-
-# Create console handler
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-
-# Create formatter
-formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-console_handler.setFormatter(formatter)
-
-# Add handler to logger
-logger.addHandler(console_handler)
-
-# Set log level for other modules
-logging.getLogger("werkzeug").setLevel(logging.WARNING)  # Flask logs
-logging.getLogger("ryu.base.app_manager").setLevel(logging.WARNING)
-logging.getLogger("ryu.controller.controller").setLevel(logging.WARNING)
-logging.getLogger("ryu.lib.hub").setLevel(logging.WARNING)
 
 class TopologyMonitor(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -55,17 +94,30 @@ class TopologyMonitor(app_manager.RyuApp):
         
         # Register REST API
         wsgi = kwargs['wsgi']
+        
+        # Try to disable WSGI access logging
+        try:
+            # Set WSGI logger to WARNING level
+            if hasattr(wsgi, 'logger'):
+                wsgi.logger.setLevel(logging.WARNING)
+            # Override log_request method if it exists
+            if hasattr(wsgi, 'log_request'):
+                wsgi.log_request = lambda *args, **kwargs: None
+        except:
+            pass
+            
         wsgi.register(TopologyController, {'topology_monitor': self})
         
         # Start monitoring thread
         self.monitor_thread = hub.spawn(self._monitor)
         self.discovery_thread = hub.spawn(self._active_scan)
         self.lldp_thread = hub.spawn(self._send_lldp_packets)
+        self.stats_thread = hub.spawn(self._collect_statistics)
 
         self.host_timeout = 300  # Increase host timeout to 5 minutes
-        self.discovery_interval = 60  # Active discovery interval is 1 minute
-        self.lldp_interval = 5  # LLDP sending interval is 5 seconds
-        self.link_timeout = 15  # Link timeout is 15 seconds
+        self.discovery_interval = 120  # Active discovery interval is 2 minutes (reduced frequency)
+        self.lldp_interval = 10  # LLDP sending interval is 10 seconds (reduced frequency)
+        self.link_timeout = 30  # Link timeout is 30 seconds (increased tolerance)
 
         self.ip_to_mac = {}     # Add IP to MAC mapping
         self.pending_hosts = {} # Store hosts waiting for IP
@@ -75,6 +127,14 @@ class TopologyMonitor(app_manager.RyuApp):
         self.last_topology = None  # Store last topology information
         self.topology_changed = False  # Flag whether topology has changed
         
+        # Add traffic monitoring attributes
+        self.flow_stats = {}    # Store flow statistics
+        self.port_stats = {}    # Store port statistics
+        self.flow_stats_reply_pending = set()  # Track pending flow stats requests
+        self.port_stats_reply_pending = set()  # Track pending port stats requests
+        self.last_stats_request = 0  # Last statistics request timestamp
+        self.stats_request_interval = 3  # Statistics request interval (seconds)
+        
         logger.info("Topology monitoring initialization completed")
 
     def _is_topology_changed(self, new_topology):
@@ -83,7 +143,7 @@ class TopologyMonitor(app_manager.RyuApp):
             logger.info("First topology data")
             return True
             
-        logger.debug(f"Comparing topology:\nOld: {json.dumps(self.last_topology, indent=2)}\nNew: {json.dumps(new_topology, indent=2)}")
+        # Removed verbose topology comparison debug log
         
         # Compare number of switches and port states
         if len(new_topology['switches']) != len(self.last_topology['switches']):
@@ -216,6 +276,12 @@ class TopologyMonitor(app_manager.RyuApp):
                     self.last_topology = current_topology
                     self.topology_changed = True
                     self._notify_topology_change()
+                elif self.topology_changed:
+                    # If topology_changed flag is set by other events, still notify
+                    logger.info("Topology changed by external event, sending update")
+                    self.last_topology = current_topology
+                    self.topology_changed = False
+                    self._notify_topology_change()
                 
             except Exception as e:
                 logger.error(f"Monitoring error: {str(e)}")
@@ -250,15 +316,15 @@ class TopologyMonitor(app_manager.RyuApp):
                         if host.get('is_active') and host.get('ip'):
                             known_ips.add(host['ip'])
                     
-                    # Send ARP requests to each port
+                    # Send ARP requests to each port (limited scanning)
                     for port in switch.ports:
                         if port.port_no != datapath.ofproto.OFPP_LOCAL:
-                            # Send ARP requests to possible host IPs
-                            for i in range(1, 255):  # Scan the entire subnet
+                            # Only scan a limited range for active discovery
+                            for i in range(1, 11):  # Only scan first 10 IPs
                                 target_ip = f'10.0.0.{i}'
                                 if target_ip not in known_ips:
                                     self._send_arp_request(datapath, port.port_no, port.hw_addr, target_ip)
-                                    hub.sleep(0.1)  # Add small delay to avoid sending too fast
+                                    hub.sleep(0.2)  # Slower scanning to avoid flooding
                 
             except Exception as e:
                 logger.error(f"Active scan error: {str(e)}")
@@ -311,13 +377,19 @@ class TopologyMonitor(app_manager.RyuApp):
 
     def _cleanup_hosts(self):
         """Clean up invalid host information"""
+        current_time = time.time()
         hosts_to_remove = []
+        
         for mac, host in self.hosts.items():
             port_key = (host['dpid'], host['port'])
-            # Check port state and link state
+            # Check port state
             port_down = not self.port_states.get(port_key, True)
             
-            # Check if the port exists in any active links
+            # Check if host has been inactive for too long
+            last_seen = host.get('last_seen', current_time)
+            inactive_too_long = (current_time - last_seen) > self.host_timeout
+            
+            # Check if the port exists in any active links (this indicates it's an inter-switch link)
             port_in_link = False
             for link in self.links:
                 if ((link.src.dpid == host['dpid'] and link.src.port_no == host['port']) or
@@ -325,10 +397,13 @@ class TopologyMonitor(app_manager.RyuApp):
                     port_in_link = True
                     break
             
-            # Only remove host if the port is indeed down
-            if port_down and not port_in_link:
+            # Remove host only if:
+            # 1. Port is down AND it's not in a link (to avoid removing hosts on inter-switch ports)
+            # 2. OR host has been inactive for too long
+            if (port_down and not port_in_link) or inactive_too_long:
                 hosts_to_remove.append(mac)
-                logger.info(f"Removed host due to port down: {mac}")
+                reason = "inactive timeout" if inactive_too_long else "port down"
+                logger.info(f"Removed host due to {reason}: {mac}")
         
         for mac in hosts_to_remove:
             del self.hosts[mac]
@@ -346,6 +421,155 @@ class TopologyMonitor(app_manager.RyuApp):
                 logger.error(f"Error sending LLDP packets: {e}")
             hub.sleep(self.lldp_interval)
 
+    def _collect_statistics(self):
+        """Collect traffic statistics from all switches"""
+        while True:
+            try:
+                current_time = time.time()
+                if current_time - self.last_stats_request >= self.stats_request_interval:
+                    self._request_flow_stats()
+                    self._request_port_stats()
+                    self.last_stats_request = current_time
+                hub.sleep(1)
+            except Exception as e:
+                logger.error(f"Error in statistics collection: {str(e)}")
+                hub.sleep(5)
+
+    def _request_flow_stats(self):
+        """Request flow statistics from all connected switches"""
+        for dpid, datapath in self.datapaths.items():
+            if dpid not in self.flow_stats_reply_pending:
+                try:
+                    ofproto = datapath.ofproto
+                    parser = datapath.ofproto_parser
+                    
+                    req = parser.OFPFlowStatsRequest(datapath)
+                    datapath.send_msg(req)
+                    self.flow_stats_reply_pending.add(dpid)
+                    # Removed frequent flow stats request log
+                except Exception as e:
+                    logger.error(f"Failed to request flow stats from switch {dpid}: {str(e)}")
+
+    def _request_port_stats(self):
+        """Request port statistics from all connected switches"""
+        for dpid, datapath in self.datapaths.items():
+            if dpid not in self.port_stats_reply_pending:
+                try:
+                    ofproto = datapath.ofproto
+                    parser = datapath.ofproto_parser
+                    
+                    req = parser.OFPPortStatsRequest(datapath, 0, ofproto.OFPP_ANY)
+                    datapath.send_msg(req)
+                    self.port_stats_reply_pending.add(dpid)
+                    # Removed frequent port stats request log
+                except Exception as e:
+                    logger.error(f"Failed to request port stats from switch {dpid}: {str(e)}")
+
+    @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
+    def flow_stats_reply_handler(self, ev):
+        """Handle flow statistics reply"""
+        msg = ev.msg
+        datapath = msg.datapath
+        dpid = datapath.id
+        
+        try:
+            # Remove from pending set
+            self.flow_stats_reply_pending.discard(dpid)
+            
+            # Initialize flow stats for this switch
+            if dpid not in self.flow_stats:
+                self.flow_stats[dpid] = {}
+            
+            # Process each flow entry
+            for stat in msg.body:
+                match = stat.match
+                priority = stat.priority
+                
+                # Create flow key for identification
+                flow_key = f"{priority}_{hash(str(match))}"
+                
+                # Store flow statistics
+                self.flow_stats[dpid][flow_key] = {
+                    'match': str(match),
+                    'priority': priority,
+                    'packet_count': stat.packet_count,
+                    'byte_count': stat.byte_count,
+                    'duration_sec': stat.duration_sec,
+                    'duration_nsec': stat.duration_nsec,
+                    'idle_timeout': stat.idle_timeout,
+                    'hard_timeout': stat.hard_timeout,
+                    'timestamp': time.time()
+                }
+            
+            # Removed frequent flow stats update log
+            
+        except Exception as e:
+            logger.error(f"Error processing flow stats reply from switch {dpid}: {str(e)}")
+
+    @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+    def port_stats_reply_handler(self, ev):
+        """Handle port statistics reply"""
+        msg = ev.msg
+        datapath = msg.datapath
+        dpid = datapath.id
+        
+        try:
+            # Remove from pending set
+            self.port_stats_reply_pending.discard(dpid)
+            
+            # Initialize port stats for this switch
+            if dpid not in self.port_stats:
+                self.port_stats[dpid] = {}
+            
+            # Process each port statistics
+            for stat in msg.body:
+                port_no = stat.port_no
+                
+                # Skip local and controller ports
+                if port_no >= 0xffffff00:
+                    continue
+                
+                # Calculate throughput if we have previous data
+                prev_stats = self.port_stats[dpid].get(port_no, {})
+                current_time = time.time()
+                
+                rx_throughput = 0
+                tx_throughput = 0
+                
+                if prev_stats and 'timestamp' in prev_stats:
+                    time_diff = current_time - prev_stats['timestamp']
+                    if time_diff > 0:
+                        rx_bytes_diff = stat.rx_bytes - prev_stats.get('rx_bytes', 0)
+                        tx_bytes_diff = stat.tx_bytes - prev_stats.get('tx_bytes', 0)
+                        
+                        rx_throughput = max(0, rx_bytes_diff / time_diff) * 8  # Convert to bits per second
+                        tx_throughput = max(0, tx_bytes_diff / time_diff) * 8  # Convert to bits per second
+                
+                # Store port statistics
+                self.port_stats[dpid][port_no] = {
+                    'port_no': port_no,
+                    'rx_packets': stat.rx_packets,
+                    'tx_packets': stat.tx_packets,
+                    'rx_bytes': stat.rx_bytes,
+                    'tx_bytes': stat.tx_bytes,
+                    'rx_dropped': stat.rx_dropped,
+                    'tx_dropped': stat.tx_dropped,
+                    'rx_errors': stat.rx_errors,
+                    'tx_errors': stat.tx_errors,
+                    'rx_frame_err': stat.rx_frame_err,
+                    'rx_over_err': stat.rx_over_err,
+                    'rx_crc_err': stat.rx_crc_err,
+                    'collisions': stat.collisions,
+                    'rx_throughput': rx_throughput,
+                    'tx_throughput': tx_throughput,
+                    'timestamp': current_time
+                }
+            
+            # Removed frequent port stats update log
+            
+        except Exception as e:
+            logger.error(f"Error processing port stats reply from switch {dpid}: {str(e)}")
+
     def _send_lldp_probes(self):
         """Send LLDP probe packets"""
         for dpid, switch in self.switches.items():
@@ -361,7 +585,7 @@ class TopologyMonitor(app_manager.RyuApp):
                     except Exception as e:
                         logger.error(f"Error sending LLDP probe on switch {dpid} port {port.port_no}: {e}")
             
-        logger.debug("Completed LLDP probe cycle")
+        # Removed frequent LLDP probe cycle log
 
     def _send_lldp_packet(self, datapath, port_no, hw_addr):
         """Send LLDP packet to specified port"""
@@ -478,7 +702,7 @@ class TopologyMonitor(app_manager.RyuApp):
                 src_dpid, dst_dpid = dst_dpid, src_dpid
                 src_port_no, dst_port_no = dst_port_no, src_port_no
             
-            logger.debug(f"Attempting to {'add' if is_up else 'remove'} link: {src_dpid}:{src_port_no} -> {dst_dpid}:{dst_port_no}")
+            # Removed frequent link state update debug log
             
             # Ensure self.links is a list
             if not isinstance(self.links, list):
@@ -552,7 +776,8 @@ class TopologyMonitor(app_manager.RyuApp):
                     self.topology_changed = True
                     self._notify_topology_change()
                 else:
-                    logger.debug(f"Link not found for removal: {src_dpid}:{src_port_no} -> {dst_dpid}:{dst_port_no}")
+                    # Removed frequent link removal debug log
+                    pass
 
             return True
             
@@ -571,31 +796,15 @@ class TopologyMonitor(app_manager.RyuApp):
         
         logger.info(f"Detected link add event: {src_dpid}:{src_port_no} -> {dst_dpid}:{dst_port_no}")
         
-        # 1. Activate ports
-        src_activated = self._configure_port(src_dpid, src_port_no, True)
-        dst_activated = self._configure_port(dst_dpid, dst_port_no, True)
-        
-        if not src_activated or not dst_activated:
-            logger.error("Port activation failed, cannot add link")
-            return
+        # Update port states directly (OpenFlow handles port configuration automatically)
+        self.port_states[(src_dpid, src_port_no)] = True
+        self.port_states[(dst_dpid, dst_port_no)] = True
             
         # 2. Update link state
         if self.update_link_state(src_dpid, dst_dpid, src_port_no, dst_port_no, True):
             logger.info(f"Link added successfully: {src_dpid}:{src_port_no} -> {dst_dpid}:{dst_port_no}")
             
-            # 3. Update flow table - Add flow table for both directions
-            if src_dpid in self.datapaths and dst_dpid in self.datapaths:
-                src_dp = self.datapaths[src_dpid]
-                dst_dp = self.datapaths[dst_dpid]
-                
-                # Add flow table for source switch
-                self._install_path_flows(src_dp, src_port_no, dst_port_no)
-                # Add flow table for destination switch
-                self._install_path_flows(dst_dp, dst_port_no, src_port_no)
-                
-                logger.info(f"Installed flow tables for both ends of link: {src_dpid}:{src_port_no} <-> {dst_dpid}:{dst_port_no}")
-            
-            # 4. Send LLDP probes to confirm link state
+            # 3. Send LLDP probes to confirm link state
             if src_dpid in self.datapaths and dst_dpid in self.datapaths:
                 src_dp = self.datapaths[src_dpid]
                 dst_dp = self.datapaths[dst_dpid]
@@ -605,79 +814,12 @@ class TopologyMonitor(app_manager.RyuApp):
                 if src_hw_addr and dst_hw_addr:
                     self._send_lldp_packet(src_dp, src_port_no, src_hw_addr)
                     self._send_lldp_packet(dst_dp, dst_port_no, dst_hw_addr)
-                    logger.debug("Sent LLDP probes to confirm link state")
-                    
-            # 5. Recalculate forwarding paths for all hosts
-            self._update_all_host_paths()
+                    # Removed frequent LLDP probe confirmation log
         else:
             logger.error(f"Failed to add link: {src_dpid}:{src_port_no} -> {dst_dpid}:{dst_port_no}")
 
-    def _install_path_flows(self, datapath, in_port, out_port):
-        """Install flow table rules for path"""
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
-        
-        # 1. Install forward flow table rule
-        match = parser.OFPMatch(in_port=in_port)
-        actions = [parser.OFPActionOutput(out_port)]
-        self.add_flow(datapath, 1, match, actions)
-        
-        # 2. Install reverse flow table rule
-        match = parser.OFPMatch(in_port=out_port)
-        actions = [parser.OFPActionOutput(in_port)]
-        self.add_flow(datapath, 1, match, actions)
-        
-        logger.info(f"Installed bidirectional flow tables: dpid={datapath.id}, ports={in_port}<->{out_port}")
-
-    def _update_all_host_paths(self):
-        """Update forwarding paths for all hosts"""
-        # Get all active hosts
-        active_hosts = [(mac, host) for mac, host in self.hosts.items() 
-                       if host.get('is_active', True)]
-        
-        # Update paths between each pair of hosts
-        for i, (mac1, host1) in enumerate(active_hosts):
-            for mac2, host2 in active_hosts[i+1:]:
-                if host1['dpid'] != host2['dpid']:  # Hosts on different switches
-                    # Install flow tables for both directions
-                    self._install_host_to_host_flows(host1, host2)
-                    self._install_host_to_host_flows(host2, host1)
-
-    def _install_host_to_host_flows(self, src_host, dst_host):
-        """Install flow table rules between two hosts"""
-        if src_host['dpid'] not in self.datapaths or dst_host['dpid'] not in self.datapaths:
-            return
-            
-        src_dp = self.datapaths[src_host['dpid']]
-        parser = src_dp.ofproto_parser
-        
-        # Install flow table from source host to destination host
-        match = parser.OFPMatch(
-            in_port=src_host['port'],
-            eth_dst=dst_host['mac']
-        )
-        
-        # If source and destination hosts are on the same switch
-        if src_host['dpid'] == dst_host['dpid']:
-            actions = [parser.OFPActionOutput(dst_host['port'])]
-            self.add_flow(src_dp, 2, match, actions)  # Set priority to 2
-            logger.info(f"Installed same-switch host flow table: {src_host['mac']}->{dst_host['mac']}")
-        else:
-            # Find out port to destination switch
-            out_port = self._find_out_port(src_host['dpid'], dst_host['dpid'])
-            if out_port:
-                actions = [parser.OFPActionOutput(out_port)]
-                self.add_flow(src_dp, 2, match, actions)
-                logger.info(f"Installed cross-switch host flow table: {src_host['mac']}->{dst_host['mac']}")
-
-    def _find_out_port(self, src_dpid, dst_dpid):
-        """Find out port from source switch to destination switch"""
-        for link in self.links:
-            if link.src.dpid == src_dpid and link.dst.dpid == dst_dpid:
-                return link.src.port_no
-            elif link.dst.dpid == src_dpid and link.src.dpid == dst_dpid:
-                return link.dst.port_no
-        return None
+    # Removed complex path management methods - using simple learning switch is sufficient
+    # The packet_in_handler already implements MAC learning which provides adequate forwarding
 
     @set_ev_cls(event.EventLinkDelete)
     def link_delete_handler(self, ev):
@@ -690,12 +832,9 @@ class TopologyMonitor(app_manager.RyuApp):
         
         logger.info(f"Detected link delete event: {src_dpid}:{src_port_no} -> {dst_dpid}:{dst_port_no}")
         
-        # 1. Deactivate ports
-        src_deactivated = self._configure_port(src_dpid, src_port_no, False)
-        dst_deactivated = self._configure_port(dst_dpid, dst_port_no, False)
-        
-        if not src_deactivated or not dst_deactivated:
-            logger.warning("Port deactivation failed, continuing with link deletion")
+        # Update port states directly
+        self.port_states[(src_dpid, src_port_no)] = False
+        self.port_states[(dst_dpid, dst_port_no)] = False
         
         # 2. Update link state
         if self.update_link_state(src_dpid, dst_dpid, src_port_no, dst_port_no, False):
@@ -703,60 +842,24 @@ class TopologyMonitor(app_manager.RyuApp):
             
             # 3. Delete related flow tables
             self._remove_flow_tables(src_dpid, dst_dpid, src_port_no, dst_port_no)
-            
-            # 4. Update port states
-            self.port_states[(src_dpid, src_port_no)] = False
-            self.port_states[(dst_dpid, dst_port_no)] = False
         else:
             logger.error(f"Failed to delete link: {src_dpid}:{src_port_no} -> {dst_dpid}:{dst_port_no}")
 
     def _configure_port(self, dpid, port_no, is_up):
-        """Configure switch port state"""
+        """Simplified port state management - just update local cache"""
         if dpid not in self.datapaths:
             logger.error(f"Switch {dpid} not connected to controller")
             return False
-            
-        datapath = self.datapaths[dpid]
-        ofproto = datapath.ofproto
-        parser = datapath.ofproto_parser
         
-        # Get current port configuration
-        port_config = 0
-        if not is_up:
-            port_config = ofproto.OFPPC_PORT_DOWN
+        # Update port state cache
+        self.port_states[(dpid, port_no)] = is_up
+        # Removed frequent port state cache update log
         
-        # Get port MAC address
-        hw_addr = self._get_port_hw_addr(dpid, port_no)
-        if not hw_addr:
-            logger.error(f"Could not get port MAC address: dpid={dpid}, port={port_no}")
-            return False
+        # If port is enabled, install necessary flow tables
+        if is_up and dpid in self.datapaths:
+            self._install_port_flows(self.datapaths[dpid], port_no)
         
-        try:
-            # Construct port modification message
-            mask = ofproto.OFPPC_PORT_DOWN
-            port_mod = parser.OFPPortMod(
-                datapath=datapath,
-                port_no=port_no,
-                hw_addr=hw_addr,
-                config=port_config,
-                mask=mask,
-                advertise=0)  # Do not modify advertise field
-                
-            datapath.send_msg(port_mod)
-            logger.info(f"Port state updated: dpid={dpid}, port={port_no}, is_up={is_up}")
-            
-            # Update port state cache
-            self.port_states[(dpid, port_no)] = is_up
-            
-            # If port is enabled, install necessary flow tables
-            if is_up:
-                self._install_port_flows(datapath, port_no)
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to update port state: dpid={dpid}, port={port_no}, error={str(e)}")
-            return False
+        return True
 
     def _get_port_hw_addr(self, dpid, port_no):
         """Get port MAC address"""
@@ -767,15 +870,7 @@ class TopologyMonitor(app_manager.RyuApp):
                     return port.hw_addr
         return None
 
-    def _update_flow_tables(self, src_dpid, dst_dpid, src_port_no, dst_port_no):
-        """Update flow tables for both ends of the link"""
-        # Update source switch flow table
-        if src_dpid in self.datapaths:
-            self._add_flow_entry(self.datapaths[src_dpid], src_port_no, dst_port_no)
-            
-        # Update destination switch flow table
-        if dst_dpid in self.datapaths:
-            self._add_flow_entry(self.datapaths[dst_dpid], dst_port_no, src_port_no)
+    # Removed unused method _update_flow_tables - functionality replaced by _install_path_flows
 
     def _remove_flow_tables(self, src_dpid, dst_dpid, src_port_no, dst_port_no):
         """Delete flow tables related to the link"""
@@ -1072,54 +1167,9 @@ class TopologyMonitor(app_manager.RyuApp):
         except Exception as e:
             logger.error(f"Error processing LLDP packet: {e}")
 
-    def _handle_lldp_link(self, src_dpid, src_port_no, dst_dpid, dst_port_no):
-        """Handle LLDP-discovered link"""
-        # Check if both source and destination switches exist
-        if src_dpid not in self.switches or dst_dpid not in self.switches:
-            return
+    # Removed unused method _handle_lldp_link - functionality integrated into _handle_lldp
 
-        # Use update_link_state method to add link
-        self.update_link_state(src_dpid, dst_dpid, src_port_no, dst_port_no, True)
-
-    def _update_host_info(self, mac, dpid, port, pkt):
-        """Update host information"""
-        # Check if it's a new host
-        is_new_host = mac not in self.hosts
-        
-        # Get IP address
-        ip = self._get_ip_from_packet(pkt)
-        
-        # Update host information
-        if is_new_host:
-            self.hosts[mac] = {
-                'mac': mac,
-                'dpid': dpid,
-                'port': port,
-                'ip': ip,
-                'last_seen': time.time()
-            }
-            logger.info(f"New host detected: mac={mac}, ip={ip}, dpid={dpid}, port={port}")
-        else:
-            # Check if IP has changed
-            old_ip = self.hosts[mac].get('ip')
-            if ip and ip != old_ip:
-                logger.info(f"Host IP changed: mac={mac}, old_ip={old_ip}, new_ip={ip}")
-                self.hosts[mac]['ip'] = ip
-            
-            # Update last seen time
-            self.hosts[mac]['last_seen'] = time.time()
-            
-            # If port has changed, update port information
-            if self.hosts[mac]['port'] != port:
-                logger.info(f"Host port changed: mac={mac}, old_port={self.hosts[mac]['port']}, new_port={port}")
-                self.hosts[mac]['port'] = port
-        
-        # Update IP to MAC mapping
-        if ip:
-            self.ip_to_mac[ip] = mac
-        
-        # Mark topology change
-        self.topology_changed = True
+    # Removed unused method _update_host_info - functionality integrated into _packet_in_handler
 
     def _get_ip_from_packet(self, pkt):
         """Extract IP address from packet"""
@@ -1179,41 +1229,7 @@ class TopologyMonitor(app_manager.RyuApp):
         
         datapath.send_msg(out)
 
-    def _discover_hosts(self):
-        """Actively discover hosts"""
-        current_time = time.time()
-        
-        # Check and mark inactive hosts
-        for mac, host in self.hosts.items():
-            if current_time - host['last_seen'] > self.host_timeout:
-                if host.get('is_active', True):
-                    host['is_active'] = False
-                    logger.info(f"Host {mac} marked as inactive")
-            elif not host.get('is_active', True):
-                host['is_active'] = True
-                logger.info(f"Host {mac} is active again")
-
-        # Send ARP requests to each port of each switch
-        for dpid, switch in self.switches.items():
-            if dpid not in self.datapaths:
-                continue
-            datapath = self.datapaths[dpid]
-            
-            # Get known active host IPs
-            known_ips = set()
-            for host in self.hosts.values():
-                if host.get('is_active') and host.get('ip'):
-                    known_ips.add(host['ip'])
-            
-            # Send ARP request to each port
-            for port in switch.ports:
-                if port.port_no != datapath.ofproto.OFPP_LOCAL:
-                    # Send ARP request to possible host IPs
-                    for i in range(1, 255):  # Scan entire subnet
-                        target_ip = f'10.0.0.{i}'
-                        if target_ip not in known_ips:
-                            self._send_arp_request(datapath, port.port_no, port.hw_addr, target_ip)
-                            hub.sleep(0.1)  # Add small delay to avoid sending too fast
+    # Removed unused method _discover_hosts - functionality integrated into _active_scan
 
     @set_ev_cls(ofp_event.EventOFPPortStatus, MAIN_DISPATCHER)
     def port_status_handler(self, ev):
@@ -1262,17 +1278,19 @@ class TopologyMonitor(app_manager.RyuApp):
             # Install default flows
             self._install_port_flows(dp, port_no)
             
-            # Send LLDP probe
+            # Send LLDP probe (delayed to avoid startup flood)
             if hw_addr:
-                self._send_lldp_packet(dp, port_no, hw_addr)
-                logger.info(f"Sent LLDP probe to new port: dpid={dp.id}, port={port_no}")
+                def delayed_lldp():
+                    hub.sleep(1)  # Wait before sending LLDP
+                    self._send_lldp_packet(dp, port_no, hw_addr)
+                    logger.info(f"Sent LLDP probe to new port: dpid={dp.id}, port={port_no}")
+                hub.spawn(delayed_lldp)
         
         # Handle link state changes
         self._handle_port_status_change(dp.id, port_no, is_live)
         
         # Trigger topology update
         self.topology_changed = True
-        self._notify_topology_change()
 
     def _install_port_flows(self, datapath, port_no):
         """Install necessary flows for new port"""
@@ -1323,6 +1341,19 @@ class TopologyMonitor(app_manager.RyuApp):
                     self._send_lldp_packet(datapath, port_no, hw_addr)
                     # Install necessary flows
                     self._install_port_flows(datapath, port_no)
+                    
+                    # Schedule lighter host rediscovery on this port (only for known subnet)
+                    logger.info(f"Scheduling host discovery for restored port: dpid={dpid}, port={port_no}")
+                    # Only send ARP requests for a limited range and with delay
+                    def delayed_host_discovery():
+                        hub.sleep(2)  # Wait for port to stabilize
+                        for i in range(1, 11):  # Only scan first 10 IPs
+                            target_ip = f'10.0.0.{i}'
+                            self._send_arp_request(datapath, port_no, hw_addr, target_ip)
+                            hub.sleep(0.1)  # Slower ARP requests
+                    
+                    # Start discovery in background
+                    hub.spawn(delayed_host_discovery)
 
     def get_port_speed(self, dpid, port_no):
         """Get port speed information
@@ -1365,16 +1396,34 @@ class TopologyMonitor(app_manager.RyuApp):
                 'hosts': []
             }
 
-        # Get switch information
+        # Get switch information with traffic statistics
         switches = []
         for dpid, switch in self.switches.items():
             ports = []
             for port in switch.ports:
                 if port.port_no != ofproto_v1_3.OFPP_LOCAL:
+                    # Get port traffic statistics
+                    port_traffic = {}
+                    if dpid in self.port_stats and port.port_no in self.port_stats[dpid]:
+                        port_stats = self.port_stats[dpid][port.port_no]
+                        port_traffic = {
+                            'rx_packets': port_stats.get('rx_packets', 0),
+                            'tx_packets': port_stats.get('tx_packets', 0),
+                            'rx_bytes': port_stats.get('rx_bytes', 0),
+                            'tx_bytes': port_stats.get('tx_bytes', 0),
+                            'rx_throughput': port_stats.get('rx_throughput', 0),
+                            'tx_throughput': port_stats.get('tx_throughput', 0),
+                            'rx_dropped': port_stats.get('rx_dropped', 0),
+                            'tx_dropped': port_stats.get('tx_dropped', 0),
+                            'rx_errors': port_stats.get('rx_errors', 0),
+                            'tx_errors': port_stats.get('tx_errors', 0)
+                        }
+                    
                     port_data = {
                         'port_no': port.port_no,
                         'hw_addr': str(port.hw_addr),
-                        'is_live': self.port_states.get((dpid, port.port_no), True)
+                        'is_live': self.port_states.get((dpid, port.port_no), True),
+                        'traffic': port_traffic
                     }
                     ports.append(port_data)
             switches.append({
@@ -1402,21 +1451,47 @@ class TopologyMonitor(app_manager.RyuApp):
             src_port = link.src.port_no
             dst_port = link.dst.port_no
 
+            # Get traffic statistics for both directions of the link
+            src_traffic = {}
+            if src_dpid in self.port_stats and src_port in self.port_stats[src_dpid]:
+                src_stats = self.port_stats[src_dpid][src_port]
+                src_traffic = {
+                    'rx_throughput': src_stats.get('rx_throughput', 0),
+                    'tx_throughput': src_stats.get('tx_throughput', 0),
+                    'rx_bytes': src_stats.get('rx_bytes', 0),
+                    'tx_bytes': src_stats.get('tx_bytes', 0)
+                }
+
+            dst_traffic = {}
+            if dst_dpid in self.port_stats and dst_port in self.port_stats[dst_dpid]:
+                dst_stats = self.port_stats[dst_dpid][dst_port]
+                dst_traffic = {
+                    'rx_throughput': dst_stats.get('rx_throughput', 0),
+                    'tx_throughput': dst_stats.get('tx_throughput', 0),
+                    'rx_bytes': dst_stats.get('rx_bytes', 0),
+                    'tx_bytes': dst_stats.get('tx_bytes', 0)
+                }
+
+            # Calculate total link throughput (bidirectional)
+            total_throughput = src_traffic.get('tx_throughput', 0) + dst_traffic.get('tx_throughput', 0)
+
             # Only add link in one direction, using smaller dpid as source
             if src_dpid <= dst_dpid:
                 link_key = (src_dpid, dst_dpid, src_port, dst_port)
                 if link_key not in seen_links:
                     links.append({
-                        'src': {'dpid': src_dpid, 'port_no': src_port},
-                        'dst': {'dpid': dst_dpid, 'port_no': dst_port}
+                        'src': {'dpid': src_dpid, 'port_no': src_port, 'traffic': src_traffic},
+                        'dst': {'dpid': dst_dpid, 'port_no': dst_port, 'traffic': dst_traffic},
+                        'total_throughput': total_throughput
                     })
                     seen_links.add(link_key)
             else:
                 link_key = (dst_dpid, src_dpid, dst_port, src_port)
                 if link_key not in seen_links:
                     links.append({
-                        'src': {'dpid': dst_dpid, 'port_no': dst_port},
-                        'dst': {'dpid': src_dpid, 'port_no': src_port}
+                        'src': {'dpid': dst_dpid, 'port_no': dst_port, 'traffic': dst_traffic},
+                        'dst': {'dpid': src_dpid, 'port_no': src_port, 'traffic': src_traffic},
+                        'total_throughput': total_throughput
                     })
                     seen_links.add(link_key)
 
@@ -1441,6 +1516,19 @@ class TopologyMonitor(app_manager.RyuApp):
                     port_status = self.port_states.get((host['dpid'], host['port']), True)
                     port_speed = self.get_port_speed(host['dpid'], host['port'])
                     
+                    # Get host traffic statistics from connected switch port
+                    host_traffic = {}
+                    if host['dpid'] in self.port_stats and host['port'] in self.port_stats[host['dpid']]:
+                        port_stats = self.port_stats[host['dpid']][host['port']]
+                        host_traffic = {
+                            'rx_throughput': port_stats.get('rx_throughput', 0),
+                            'tx_throughput': port_stats.get('tx_throughput', 0),
+                            'rx_bytes': port_stats.get('rx_bytes', 0),
+                            'tx_bytes': port_stats.get('tx_bytes', 0),
+                            'rx_packets': port_stats.get('rx_packets', 0),
+                            'tx_packets': port_stats.get('tx_packets', 0)
+                        }
+                    
                     host_data = {
                         'mac': mac,
                         'dpid': host['dpid'],
@@ -1449,7 +1537,8 @@ class TopologyMonitor(app_manager.RyuApp):
                         'last_seen': last_seen_time,
                         'is_active': is_active,
                         'port_status': port_status,
-                        'port_speed': port_speed
+                        'port_speed': port_speed,
+                        'traffic': host_traffic
                     }
                     valid_hosts.append(host_data)
 
@@ -1459,10 +1548,15 @@ class TopologyMonitor(app_manager.RyuApp):
         topology_data = {
             'switches': switches,
             'links': links,
-            'hosts': valid_hosts
+            'hosts': valid_hosts,
+            'traffic_stats': {
+                'flow_stats': self.flow_stats.copy(),
+                'port_stats': self.port_stats.copy(),
+                'timestamp': time.time()
+            }
         }
         
-        logger.debug(f"Topology data generated: {len(switches)} switches, {len(links)} links, {len(valid_hosts)} hosts")
+        # Removed frequent topology data generation log
         return topology_data
 
     def _is_valid_ipv4(self, ip):
@@ -1549,47 +1643,9 @@ class TopologyMonitor(app_manager.RyuApp):
             
         return True
 
-    def _validate_switch_config(self, dpid, config):
-        """Validate switch configuration"""
-        if dpid not in self.switches:
-            return False
-            
-        switch = self.switches[dpid]
-        # Validate port configuration
-        for port in config.get('ports', []):
-            if not self._validate_port_config(switch, port):
-                return False
-                
-        return True
+    # Removed unused validation methods _validate_switch_config and _validate_port_config
 
-    def _validate_port_config(self, switch, port_config):
-        """Validate port configuration"""
-        port_no = port_config.get('port_no')
-        if not port_no:
-            return False
-            
-        # Check if port exists
-        port_exists = any(port.port_no == port_no for port in switch.ports)
-        if not port_exists:
-            return False
-            
-        return True
-
-    def _notify_port_state_change(self, dpid, port_no, is_up):
-        """Notify port state change"""
-        port_key = (dpid, port_no)
-        old_state = self.port_states.get(port_key, False)
-        
-        if old_state != is_up:
-            logger.info(f"Port {port_no} on switch {dpid} {'up' if is_up else 'down'}")
-            self.port_states[port_key] = is_up
-            self.topology_changed = True
-            
-            # Trigger related processing
-            if is_up:
-                self._handle_port_up(dpid, port_no)
-            else:
-                self._handle_port_down(dpid, port_no)
+    # Removed unused method _notify_port_state_change - functionality integrated into port_status_handler
 
     def _handle_port_up(self, dpid, port_no):
         """Handle port restoration event"""
@@ -1604,7 +1660,7 @@ class TopologyMonitor(app_manager.RyuApp):
     def _notify_topology_change(self):
         """Notify topology changes to all WebSocket clients"""
         if not self.ws_clients:
-            logger.debug("No connected WebSocket clients, cannot send topology update")
+            # Removed frequent WebSocket client connection log
             return
             
         try:
@@ -1628,7 +1684,9 @@ class TopologyMonitor(app_manager.RyuApp):
                     self.ws_clients.discard(ws_client)
                     
             if active_clients > 0:
-                logger.debug(f"Sent topology update to {active_clients} clients")
+                # Only log if there are multiple clients connected
+                if active_clients > 1:
+                    logger.debug(f"Sent topology update to {active_clients} clients")
             
         except Exception as e:
             logger.error(f"Failed to notify topology change: {str(e)}")
@@ -1636,7 +1694,7 @@ class TopologyMonitor(app_manager.RyuApp):
     def register_ws_client(self, ws_client):
         """Register new WebSocket client"""
         self.ws_clients.add(ws_client)
-        logger.debug(f"New WebSocket client connected, current clients: {len(self.ws_clients)}")
+        logger.info("WebSocket client connected")
         
         # Send current topology data to new client
         try:
@@ -1652,37 +1710,4 @@ class TopologyMonitor(app_manager.RyuApp):
     def unregister_ws_client(self, ws_client):
         """Unregister WebSocket client"""
         self.ws_clients.discard(ws_client)
-        logger.debug(f"WebSocket client disconnected, remaining clients: {len(self.ws_clients)}")
-
-class TopologyController(ControllerBase):
-    def __init__(self, req, link, data, **config):
-        super(TopologyController, self).__init__(req, link, data, **config)
-        self.topology_monitor = data['topology_monitor']
-
-    @route('topology', '/topology', methods=['GET'])
-    def get_topology(self, req, **kwargs):
-        """REST API: Return complete topology data"""
-        try:
-            # Get current topology data
-            current_topology = self.topology_monitor.get_topology_data()
-            
-            # Check if forced retrieval
-            force = req.GET.get('force', 'false').lower() == 'true'
-            
-            if force or self.topology_monitor.topology_changed:
-                self.topology_monitor.topology_changed = False
-                logger.info("Sending topology data (forced or changed)")
-            elif not current_topology['switches']:
-                logger.warning("No switches found")
-                return Response(status=204)
-            
-            # Return topology data
-            return Response(
-                content_type='application/json',
-                body=json.dumps(current_topology, indent=2).encode('utf-8')
-            )
-                
-        except Exception as e:
-            logger.error(f"API Error: {str(e)}", exc_info=True)
-            return Response(status=500, 
-                          body=json.dumps({'error': str(e)}).encode('utf-8'))
+        logger.info("WebSocket client disconnected")
