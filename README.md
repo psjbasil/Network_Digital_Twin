@@ -54,9 +54,6 @@ A real-time network topology visualization system that monitors and visualizes S
 │   │   ├── css/        # Stylesheets
 │   │   └── js/         # JavaScript modules
 │   └── templates/      # HTML templates
-├── utils/              # Utility functions and configuration
-│   ├── config.py       # Configuration management
-│   └── traffic_monitor.py  # Traffic data formatting utilities
 └── setup.py            # Project installation and dependencies
 ```
 
@@ -83,7 +80,7 @@ This will install the following dependencies:
 # Follow the official Mininet installation guide:
 # http://mininet.org/download/
 ```
-Note: Make sure you have Python 3.7+ installed before proceeding with the installation.
+Note: Make sure you have Python 3.6+ installed before proceeding with the installation.
 
 ## Usage
 
@@ -143,55 +140,3 @@ mininet> h1 iperf3 -s &                              # Start iperf3 server on h1
 mininet> h2 iperf3 -c h1 -t 10 -b 500K        # Generate 500K traffic from h2 to h1
 mininet> h2 iperf3 -c h1 -t 10 -b 1M          # Generate 1M traffic from h2 to h1
 ```
-
-## Features
-
-- **Real-time Network Monitoring**:
-  - Dynamic topology visualization
-  - Link state tracking
-  - Port status monitoring
-  
-- **Traffic Analysis**:
-  - Real-time traffic flow visualization
-  - Traffic statistics dashboard
-  - Port throughput monitoring
-  
-- **Interactive Interface**:
-  - Web-based topology visualization
-  - Traffic overlay display
-  - Real-time statistics dashboard
-  - Interactive network manipulation
-
-### Traffic Monitoring Features
-
-The system provides two main traffic monitoring capabilities:
-
-1. **Real-time Traffic Visualization**:
-   - Click "Show Traffic" / "Hide Traffic" button to toggle traffic overlay
-   - Traffic flows are displayed as colored links with varying thickness
-
-2. **Traffic Statistics Dashboard**:
-   - Click "Traffic Stats" button to view detailed statistics
-   - Shows throughput, packet counts, and byte transfer data
-
-### API Endpoints
-
-The system provides the following REST API endpoints:
-
-- `GET /topology` - Get current network topology
-- `GET /traffic` - Get traffic statistics
-- `GET /traffic/summary` - Get traffic summary
-
-## Key Features Implemented
-
-- **Streamlined Architecture**: Focused on core SDN monitoring without unnecessary complexity
-- **Optimized Performance**: Efficient topology discovery and traffic monitoring
-- **Clean Code**: Reduced from 1884 to 1519 lines (19.4% reduction) while maintaining all functionality
-- **Minimal Dependencies**: Only essential packages required for core functionality
-
-## Acknowledgments
-
-- Mininet for network emulation and testing
-- Ryu for SDN controller framework and OpenFlow support
-- D3.js for interactive network visualization
-- Flask and SocketIO for real-time web interface

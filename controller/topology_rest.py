@@ -29,7 +29,6 @@ class TopologyController(ControllerBase):
             
             if force or self.topology_monitor.topology_changed:
                 self.topology_monitor.topology_changed = False
-                # Removed frequent topology request log
             elif not current_topology['switches']:
                 logger.warning("No switches found")
                 return Response(status=204)

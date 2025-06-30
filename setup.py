@@ -6,7 +6,7 @@ setup(
     description="Real-time network topology visualization system with SDN controller",
     author="Network Digital Twin Team",
     packages=find_packages(),
-    python_requires=">=3.7",
+    python_requires=">=3.6",
     install_requires=[
         'flask>=2.0.0',
         'flask-socketio>=5.0.0',
@@ -27,6 +27,7 @@ setup(
         "Intended Audience :: System Administrators",
         "License :: OSI Approved :: MIT License",
         "Programming Language :: Python :: 3",
+        "Programming Language :: Python :: 3.6",
         "Programming Language :: Python :: 3.7",
         "Programming Language :: Python :: 3.8",
         "Programming Language :: Python :: 3.9",

@@ -1690,24 +1690,3 @@ class TopologyMonitor(app_manager.RyuApp):
             
         except Exception as e:
             logger.error(f"Failed to notify topology change: {str(e)}")
-
-    def register_ws_client(self, ws_client):
-        """Register new WebSocket client"""
-        self.ws_clients.add(ws_client)
-        logger.info("WebSocket client connected")
-        
-        # Send current topology data to new client
-        try:
-            topology_data = self.get_topology_data()
-            message = {
-                'type': 'topology_update',
-                'data': topology_data
-            }
-            ws_client.send_message(json.dumps(message))
-        except Exception as e:
-            logger.error(f"Failed to send initial topology to new client: {str(e)}")
-
-    def unregister_ws_client(self, ws_client):
-        """Unregister WebSocket client"""
-        self.ws_clients.discard(ws_client)
-        logger.info("WebSocket client disconnected")

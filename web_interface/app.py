@@ -135,12 +135,6 @@ class TopologyUpdater:
                 }, namespace='/')
                 self.last_topology = topology_data
                 self.last_topology_hash = current_hash
-                if hosts_changed:
-                    # Removed frequent host IP change log
-                    pass
-                else:
-                    # Removed frequent topology change log
-                    pass
 
     def _update_loop(self):
         while True:
